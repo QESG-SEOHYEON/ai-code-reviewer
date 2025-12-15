@@ -17,12 +17,12 @@ const COMMON_RULES_PATH: string =
 const REPO_RULES_PATH: string =
   core.getInput("REPO_RULES_PATH") || ".github/ai-review/rules.md";
 // PR 설명 최대 글자수
-  const MAX_PR_DESCRIPTION_CHARS: number = (() => {
+const MAX_PR_DESCRIPTION_CHARS: number = (() => {
   const raw = core.getInput("MAX_PR_DESCRIPTION_CHARS") || "1500";
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : 1500;
 })();
-  
+
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
 const openai = new OpenAI({
@@ -49,7 +49,9 @@ function safeReadFile(filePath: string): string {
 }
 
 function loadRules(): RulesBundle {
-  const actionRoot = path.resolve(__dirname, "..");
+  // ✅ ncc 번들 환경에서 가장 안전한 액션 루트
+  const actionRoot =
+    process.env.GITHUB_ACTION_PATH || path.resolve(__dirname, "..");
   const commonAbs = path.resolve(actionRoot, COMMON_RULES_PATH);
 
   // 대상 레포는 checkout 되어 GITHUB_WORKSPACE에 있음
@@ -106,8 +108,11 @@ async function getDiff(
 
 function createSystemPrompt(rules: RulesBundle): string {
   const common = rules.commonRules || "(none)";
-  const hasRepoRules = Boolean(rules.repoRules && rules.repoRules.trim().length > 0);
+  const hasRepoRules = Boolean(
+    rules.repoRules && rules.repoRules.trim().length > 0
+  );
 
+  // ✅ repoSection에는 '블록 전체'만 들어가게(깨짐 방지)
   const repoSection = hasRepoRules
     ? `
 [레포 특화 규칙]
@@ -115,13 +120,13 @@ function createSystemPrompt(rules: RulesBundle): string {
 ${rules.repoRules.trim()}
 ---
 `
-: ""; // rules.md 없으면 섹션 자체를 빼기
+    : "";
 
-const priorityLine = hasRepoRules
-  ? `- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.`
-  : `- 레포 특화 규칙이 없으므로 **공통 가이드라인만 적용**합니다.`;
+  const priorityLine = hasRepoRules
+    ? `- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.`
+    : `- 레포 특화 규칙이 없으므로 **공통 가이드라인만 적용**합니다.`;
 
-return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 **한국어**로 작성합니다.
+  return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 반드시 **한국어**로 작성합니다.
 
 규칙 우선순위:
 ${priorityLine}
@@ -130,25 +135,20 @@ ${priorityLine}
 ---
 ${common}
 ---
-
-[레포 특화 규칙]
----
 ${repoSection}
----
-
 작성 규칙:
 - 반드시 아래 JSON만 출력: {"reviews":[{"lineNumber":<number>,"reviewComment":"<markdown, 한국어>"}]}
+- 공통규칙/레포 규칙 위반이 있으면 반드시 지적.
 - 칭찬/긍정 코멘트 금지.
 - 개선점이 없으면 reviews는 빈 배열([])로 반환.
-- **일반론 금지**: 제공된 diff에서 근거를 찾을 수 있는 내용만 지적.
+- 각 리뷰는 반드시 diff의 특정 라인을 근거로 하며, 근거 없는 일반론은 금지.
 - **코드에 주석 추가를 제안하지 않음.**
-- 공통규칙/레포 규칙 위반이 있으면 반드시 지적.
 - lineNumber는 가능한 한 **새 파일 기준(추가/수정된 라인)** 번호로 지정.`;
 }
 
-// user prompt: 실제 PR 컨텍스트 + diff
 function createUserPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
   const desc = truncate(prDetails.description || "", MAX_PR_DESCRIPTION_CHARS);
+
   return `다음 PR 정보를 참고해서, 아래 diff를 리뷰해줘.
 
 PR 제목: ${prDetails.title}
@@ -167,7 +167,50 @@ ${chunk.changes
   .map((c) => `${c.ln2 ?? c.ln ?? ""} ${c.content}`)
   .join("\n")}
 \`\`\`
+
+※ 출력은 반드시 한국어로만 작성하세요.
 `;
+}
+
+// 응답 검증 + 1회 재시도
+function hasHangul(text: string): boolean {
+  return /[가-힣]/.test(text);
+}
+
+function allKoreanOrEmpty(
+  reviews: Array<{ reviewComment?: string }>
+): boolean {
+  return reviews.every((r) => {
+    const c = String(r.reviewComment || "").trim();
+    if (!c) return true;
+    return hasHangul(c);
+  });
+}
+
+function safeParseReviews(raw: string): Array<{ lineNumber: string; reviewComment: string }> {
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.reviews)) return parsed.reviews;
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+async function callOpenAIOnce(systemPrompt: string, userPrompt: string) {
+  const response = await openai.chat.completions.create({
+    model: OPENAI_API_MODEL,
+    temperature: 0.1,
+    max_tokens: 700,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    response_format: { type: "json_object" } as any,
+  });
+
+  const res = response.choices[0].message?.content?.trim() || "{}";
+  return safeParseReviews(res);
 }
 
 async function getAIResponse(
@@ -175,21 +218,24 @@ async function getAIResponse(
   userPrompt: string
 ): Promise<Array<{ lineNumber: string; reviewComment: string }> | null> {
   try {
-    const response = await openai.chat.completions.create({
-      model: OPENAI_API_MODEL,
-      temperature: 0.2,
-      max_tokens: 700,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      // 모델별 분기 추가 필요할 수도
-      response_format: { type: "json_object" } as any,
-    });
+    // 1차
+    let reviews = await callOpenAIOnce(systemPrompt, userPrompt);
+    // 재시도
+    if (!allKoreanOrEmpty(reviews)) {
+      core.info("Non-Korean response detected. Retrying once with stricter rule.");
 
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    const parsed = JSON.parse(res);
-    const reviews = Array.isArray(parsed?.reviews) ? parsed.reviews : [];
+      const stricterSystem =
+        systemPrompt +
+        `
+
+[추가 강제 규칙]
+- reviewComment는 반드시 한국어 문장만 사용한다.
+- 영어 문장 작성은 금지한다. 필요하면 한국어로 풀어서 설명한다.
+`;
+
+      reviews = await callOpenAIOnce(stricterSystem, userPrompt);
+    }
+
     return reviews;
   } catch (e) {
     console.error("OpenAI error:", e);
@@ -228,7 +274,7 @@ async function analyzeCode(
   const systemPrompt = createSystemPrompt(rules);
 
   for (const file of parsedDiff) {
-    if (file.to === "/dev/null") continue; // deleted files ignore
+    if (file.to === "/dev/null") continue;
 
     for (const chunk of file.chunks) {
       const userPrompt = createUserPrompt(file, chunk, prDetails);
@@ -306,16 +352,18 @@ async function main() {
   });
 
   const rules = loadRules();
-  // 레포 규칙 없으면 공통 규칙만 사용
+
   if (!rules.repoRules || rules.repoRules.trim().length === 0) {
     core.info("Repo rules not found; using common rules only.");
   }
-  // 경로 확인 로그
+
   core.info(`COMMON_RULES loaded: ${rules.commonRules ? "YES" : "NO"}`);
   core.info(`REPO_RULES loaded: ${rules.repoRules ? "YES" : "NO"}`);
   core.info(`GITHUB_WORKSPACE: ${process.env.GITHUB_WORKSPACE || "(empty)"}`);
   core.info(`COMMON_RULES_PATH: ${COMMON_RULES_PATH}`);
   core.info(`REPO_RULES_PATH: ${REPO_RULES_PATH}`);
+  core.info(`MAX_PR_DESCRIPTION_CHARS: ${MAX_PR_DESCRIPTION_CHARS}`);
+  core.info(`MODEL: ${OPENAI_API_MODEL}`);
 
   const comments = await analyzeCode(filteredDiff, prDetails, rules);
 

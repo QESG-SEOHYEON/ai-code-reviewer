@@ -15584,6 +15584,12 @@ const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
 const COMMON_RULES_PATH = core.getInput("COMMON_RULES_PATH") || "rules/common.md";
 // 레포 특화 규칙(대상 레포 내부)
 const REPO_RULES_PATH = core.getInput("REPO_RULES_PATH") || ".github/ai-review/rules.md";
+// PR 설명 최대 글자수
+const MAX_PR_DESCRIPTION_CHARS = (() => {
+    const raw = core.getInput("MAX_PR_DESCRIPTION_CHARS") || "1500";
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 1500;
+})();
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
@@ -15599,15 +15605,25 @@ function safeReadFile(filePath) {
     }
 }
 function loadRules() {
-    const actionRoot = path_1.default.resolve(__dirname, "..");
+    // ✅ ncc 번들 환경에서 가장 안전한 액션 루트
+    const actionRoot = process.env.GITHUB_ACTION_PATH || path_1.default.resolve(__dirname, "..");
     const commonAbs = path_1.default.resolve(actionRoot, COMMON_RULES_PATH);
     // 대상 레포는 checkout 되어 GITHUB_WORKSPACE에 있음
     const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
     const repoAbs = path_1.default.resolve(workspace, REPO_RULES_PATH);
     return {
         commonRules: safeReadFile(commonAbs),
-        repoRules: safeReadFile(repoAbs),
+        repoRules: safeReadFile(repoAbs).trim(),
     };
+}
+function truncate(text, maxChars) {
+    if (!text)
+        return "";
+    if (maxChars <= 0)
+        return ""; // 0이면 description 미포함
+    return text.length > maxChars
+        ? text.slice(0, maxChars) + "\n...(truncated)"
+        : text;
 }
 function getPRDetails() {
     var _a, _b;
@@ -15640,46 +15656,48 @@ function getDiff(owner, repo, pull_number) {
         return response.data;
     });
 }
-/**
- * system prompt: 정책/규칙/출력형식(한국어, JSON 강제)
- */
 function createSystemPrompt(rules) {
     const common = rules.commonRules || "(none)";
-    const repo = rules.repoRules || "(none)";
-    return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 **반드시 한국어**로 작성합니다.
+    const hasRepoRules = Boolean(rules.repoRules && rules.repoRules.trim().length > 0);
+    // ✅ repoSection에는 '블록 전체'만 들어가게(깨짐 방지)
+    const repoSection = hasRepoRules
+        ? `
+[레포 특화 규칙]
+---
+${rules.repoRules.trim()}
+---
+`
+        : "";
+    const priorityLine = hasRepoRules
+        ? `- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.`
+        : `- 레포 특화 규칙이 없으므로 **공통 가이드라인만 적용**합니다.`;
+    return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 반드시 **한국어**로 작성합니다.
 
 규칙 우선순위:
-- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.
+${priorityLine}
 
 [공통 가이드라인]
 ---
 ${common}
 ---
-
-[레포 특화 규칙]
----
-${repo}
----
-
-작성 규칙(엄격):
+${repoSection}
+작성 규칙:
 - 반드시 아래 JSON만 출력: {"reviews":[{"lineNumber":<number>,"reviewComment":"<markdown, 한국어>"}]}
+- 공통규칙/레포 규칙 위반이 있으면 반드시 지적.
 - 칭찬/긍정 코멘트 금지.
 - 개선점이 없으면 reviews는 빈 배열([])로 반환.
-- **일반론 금지**: 제공된 diff에서 근거를 찾을 수 있는 내용만 지적.
-- **코드에 주석 추가를 제안하지 마라.**
-- 공통규칙/레포 규칙 위반이 있으면 반드시 지적.
-- lineNumber는 가능한 한 **새 파일 기준(추가/수정된 라인)** 번호로 지정하라.`;
+- 각 리뷰는 반드시 diff의 특정 라인을 근거로 하며, 근거 없는 일반론은 금지.
+- **코드에 주석 추가를 제안하지 않음.**
+- lineNumber는 가능한 한 **새 파일 기준(추가/수정된 라인)** 번호로 지정.`;
 }
-/**
- * user prompt: 실제 PR 컨텍스트 + diff
- */
 function createUserPrompt(file, chunk, prDetails) {
+    const desc = truncate(prDetails.description || "", MAX_PR_DESCRIPTION_CHARS);
     return `다음 PR 정보를 참고해서, 아래 diff를 리뷰해줘.
 
 PR 제목: ${prDetails.title}
 PR 설명:
 ---
-${prDetails.description}
+${desc || "(생략)"}
 ---
 
 대상 파일: ${file.to}
@@ -15692,26 +15710,67 @@ ${chunk.changes
         .map((c) => { var _a, _b; return `${(_b = (_a = c.ln2) !== null && _a !== void 0 ? _a : c.ln) !== null && _b !== void 0 ? _b : ""} ${c.content}`; })
         .join("\n")}
 \`\`\`
+
+※ 출력은 반드시 한국어로만 작성하세요.
 `;
 }
-function getAIResponse(systemPrompt, userPrompt) {
+// 응답 검증 + 1회 재시도
+function hasHangul(text) {
+    return /[가-힣]/.test(text);
+}
+function allKoreanOrEmpty(reviews) {
+    return reviews.every((r) => {
+        const c = String(r.reviewComment || "").trim();
+        if (!c)
+            return true;
+        return hasHangul(c);
+    });
+}
+function safeParseReviews(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed === null || parsed === void 0 ? void 0 : parsed.reviews))
+            return parsed.reviews;
+        return [];
+    }
+    catch (_a) {
+        return [];
+    }
+}
+function callOpenAIOnce(systemPrompt, userPrompt) {
     var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
+        const response = yield openai.chat.completions.create({
+            model: OPENAI_API_MODEL,
+            temperature: 0.1,
+            max_tokens: 700,
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+            ],
+            response_format: { type: "json_object" },
+        });
+        const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
+        return safeParseReviews(res);
+    });
+}
+function getAIResponse(systemPrompt, userPrompt) {
+    return __awaiter(this, void 0, void 0, function* () {
         try {
-            const response = yield openai.chat.completions.create({
-                model: OPENAI_API_MODEL,
-                temperature: 0.2,
-                max_tokens: 700,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userPrompt },
-                ],
-                // 모델별 분기 추가 필요할 수도
-                response_format: { type: "json_object" },
-            });
-            const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-            const parsed = JSON.parse(res);
-            const reviews = Array.isArray(parsed === null || parsed === void 0 ? void 0 : parsed.reviews) ? parsed.reviews : [];
+            // 1차
+            let reviews = yield callOpenAIOnce(systemPrompt, userPrompt);
+            // 재시도
+            if (!allKoreanOrEmpty(reviews)) {
+                core.info("Non-Korean response detected. Retrying once with stricter rule.");
+                const stricterSystem = systemPrompt +
+                    `
+
+[추가 강제 규칙]
+- reviewComment는 반드시 한국어 문장만 사용한다.
+- 영어 문장 작성은 금지한다. 필요하면 한국어로 풀어서 설명한다.
+`;
+                reviews = yield callOpenAIOnce(stricterSystem, userPrompt);
+            }
             return reviews;
         }
         catch (e) {
@@ -15740,7 +15799,7 @@ function analyzeCode(parsedDiff, prDetails, rules) {
         const systemPrompt = createSystemPrompt(rules);
         for (const file of parsedDiff) {
             if (file.to === "/dev/null")
-                continue; // deleted files ignore
+                continue;
             for (const chunk of file.chunks) {
                 const userPrompt = createUserPrompt(file, chunk, prDetails);
                 const aiResponse = yield getAIResponse(systemPrompt, userPrompt);
@@ -15808,12 +15867,16 @@ function main() {
             return !excludePatterns.some((pattern) => (0, minimatch_1.minimatch)(filePath, pattern));
         });
         const rules = loadRules();
-        // 경로 확인 로그
+        if (!rules.repoRules || rules.repoRules.trim().length === 0) {
+            core.info("Repo rules not found; using common rules only.");
+        }
         core.info(`COMMON_RULES loaded: ${rules.commonRules ? "YES" : "NO"}`);
         core.info(`REPO_RULES loaded: ${rules.repoRules ? "YES" : "NO"}`);
         core.info(`GITHUB_WORKSPACE: ${process.env.GITHUB_WORKSPACE || "(empty)"}`);
         core.info(`COMMON_RULES_PATH: ${COMMON_RULES_PATH}`);
         core.info(`REPO_RULES_PATH: ${REPO_RULES_PATH}`);
+        core.info(`MAX_PR_DESCRIPTION_CHARS: ${MAX_PR_DESCRIPTION_CHARS}`);
+        core.info(`MODEL: ${OPENAI_API_MODEL}`);
         const comments = yield analyzeCode(filteredDiff, prDetails, rules);
         if (comments.length > 0) {
             yield createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
