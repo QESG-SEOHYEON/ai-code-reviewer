@@ -1,5 +1,9 @@
 name: "AI Code Review Action"
+runs:
+  using: "node20"
+  main: "dist/index.js"
 description: "Perform code reviews and comment on diffs using OpenAI API."
+
 inputs:
   GITHUB_TOKEN:
     description: "GitHub token to interact with the repository."
@@ -9,15 +13,20 @@ inputs:
     required: true
   OPENAI_API_MODEL:
     description: "OpenAI API model."
-    required: false
+    required: true
     default: "gpt-4"
+  COMMON_RULES_PATH:
+    description: "Path to common rules file inside the action repository"
+    required: false
+    default: "rules/common.md"
+  REPO_RULES_PATH:
+    description: "Path to repository-specific rules file inside the target repository"
+    required: false
+    default: ".github/ai-review/rules.md"
   exclude:
     description: "Glob patterns to exclude files from the diff analysis"
     required: false
     default: ""
-runs:
-  using: "node16"
-  main: "dist/index.js"
 branding:
   icon: "aperture"
   color: "green"
