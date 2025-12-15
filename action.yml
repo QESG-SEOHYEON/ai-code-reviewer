@@ -1,3 +1,8 @@
+name: Show repo rules file
+run: |
+  ls -al .github/ai-review || true
+  cat .github/ai-review/rules.md || true
+
 name: "AI Code Review Action"
 runs:
   using: "node20"
