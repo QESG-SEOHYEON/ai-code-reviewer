@@ -16,7 +16,13 @@ const COMMON_RULES_PATH: string =
 // 레포 특화 규칙(대상 레포 내부)
 const REPO_RULES_PATH: string =
   core.getInput("REPO_RULES_PATH") || ".github/ai-review/rules.md";
-
+// PR 설명 최대 글자수
+  const MAX_PR_DESCRIPTION_CHARS: number = (() => {
+  const raw = core.getInput("MAX_PR_DESCRIPTION_CHARS") || "1500";
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 1500;
+})();
+  
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
 const openai = new OpenAI({
@@ -52,8 +58,16 @@ function loadRules(): RulesBundle {
 
   return {
     commonRules: safeReadFile(commonAbs),
-    repoRules: safeReadFile(repoAbs),
+    repoRules: safeReadFile(repoAbs).trim(),
   };
+}
+
+function truncate(text: string, maxChars: number): string {
+  if (!text) return "";
+  if (maxChars <= 0) return ""; // 0이면 description 미포함
+  return text.length > maxChars
+    ? text.slice(0, maxChars) + "\n...(truncated)"
+    : text;
 }
 
 async function getPRDetails(): Promise<PRDetails> {
@@ -90,17 +104,27 @@ async function getDiff(
   return response.data;
 }
 
-/**
- * system prompt: 정책/규칙/출력형식(한국어, JSON 강제)
- */
 function createSystemPrompt(rules: RulesBundle): string {
   const common = rules.commonRules || "(none)";
-  const repo = rules.repoRules || "(none)";
+  const hasRepoRules = Boolean(rules.repoRules && rules.repoRules.trim().length > 0);
 
-  return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 **반드시 한국어**로 작성합니다.
+  const repoSection = hasRepoRules
+    ? `
+[레포 특화 규칙]
+---
+${rules.repoRules.trim()}
+---
+`
+: ""; // rules.md 없으면 섹션 자체를 빼기
+
+const priorityLine = hasRepoRules
+  ? `- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.`
+  : `- 레포 특화 규칙이 없으므로 **공통 가이드라인만 적용**합니다.`;
+
+return `당신은 QESG GitHub PR 코드리뷰 봇입니다. 모든 리뷰 코멘트는 **한국어**로 작성합니다.
 
 규칙 우선순위:
-- 공통 가이드라인과 레포 특화 규칙이 충돌하면 **레포 특화 규칙이 우선(override)** 입니다.
+${priorityLine}
 
 [공통 가이드라인]
 ---
@@ -109,33 +133,28 @@ ${common}
 
 [레포 특화 규칙]
 ---
-${repo}
+${repoSection}
 ---
 
-작성 규칙(엄격):
+작성 규칙:
 - 반드시 아래 JSON만 출력: {"reviews":[{"lineNumber":<number>,"reviewComment":"<markdown, 한국어>"}]}
 - 칭찬/긍정 코멘트 금지.
 - 개선점이 없으면 reviews는 빈 배열([])로 반환.
 - **일반론 금지**: 제공된 diff에서 근거를 찾을 수 있는 내용만 지적.
-- **코드에 주석 추가를 제안하지 마라.**
+- **코드에 주석 추가를 제안하지 않음.**
 - 공통규칙/레포 규칙 위반이 있으면 반드시 지적.
-- lineNumber는 가능한 한 **새 파일 기준(추가/수정된 라인)** 번호로 지정하라.`;
+- lineNumber는 가능한 한 **새 파일 기준(추가/수정된 라인)** 번호로 지정.`;
 }
 
-/**
- * user prompt: 실제 PR 컨텍스트 + diff
- */
-function createUserPrompt(
-  file: File,
-  chunk: Chunk,
-  prDetails: PRDetails
-): string {
+// user prompt: 실제 PR 컨텍스트 + diff
+function createUserPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
+  const desc = truncate(prDetails.description || "", MAX_PR_DESCRIPTION_CHARS);
   return `다음 PR 정보를 참고해서, 아래 diff를 리뷰해줘.
 
 PR 제목: ${prDetails.title}
 PR 설명:
 ---
-${prDetails.description}
+${desc || "(생략)"}
 ---
 
 대상 파일: ${file.to}
@@ -287,7 +306,10 @@ async function main() {
   });
 
   const rules = loadRules();
-
+  // 레포 규칙 없으면 공통 규칙만 사용
+  if (!rules.repoRules || rules.repoRules.trim().length === 0) {
+    core.info("Repo rules not found; using common rules only.");
+  }
   // 경로 확인 로그
   core.info(`COMMON_RULES loaded: ${rules.commonRules ? "YES" : "NO"}`);
   core.info(`REPO_RULES loaded: ${rules.repoRules ? "YES" : "NO"}`);

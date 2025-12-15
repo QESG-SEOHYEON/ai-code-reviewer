@@ -15,6 +15,7 @@ inputs:
     description: "OpenAI API model."
     required: true
     default: "gpt-4"
+    
   COMMON_RULES_PATH:
     description: "Path to common rules file inside the action repository"
     required: false
@@ -23,6 +24,12 @@ inputs:
     description: "Path to repository-specific rules file inside the target repository"
     required: false
     default: ".github/ai-review/rules.md"
+
+  MAX_PR_DESCRIPTION_CHARS:
+    description: "Max characters of PR description to include in prompt"
+    required: false
+    default: "1000"
+
   exclude:
     description: "Glob patterns to exclude files from the diff analysis"
     required: false
